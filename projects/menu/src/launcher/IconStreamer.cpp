@@ -107,6 +107,8 @@ void IconStreamer::onPageChanged(int currentPage, int iconsPerPage,
     int endPage   = std::min(totalPages - 1, currentPage + kPageMargin);
     int startApp  = startPage * iconsPerPage;
     int endApp    = std::min(totalApps, (endPage + 1) * iconsPerPage);
+    int curStart  = currentPage * iconsPerPage;
+    int curEnd    = std::min(totalApps, curStart + iconsPerPage);
 
     // 1. Evict textures outside the new visible range.
     for (int i = 0; i < (int)m_pool.size(); ++i) {
@@ -121,11 +123,21 @@ void IconStreamer::onPageChanged(int currentPage, int iconsPerPage,
     }
 
     // 2. Collect apps that need loading.
-    std::vector<int> toLoad;
+    // Prioritize current-page icons first so page switches never show blanks
+    // when we are under memory pressure.
+    std::vector<int> currentToLoad;
+    std::vector<int> neighborToLoad;
     for (int i = startApp; i < endApp; ++i) {
-        if (m_appToSlot[i] < 0 && !m_compressed[i].empty())
-            toLoad.push_back(i);
+        if (m_appToSlot[i] < 0 && !m_compressed[i].empty()) {
+            if (i >= curStart && i < curEnd) currentToLoad.push_back(i);
+            else neighborToLoad.push_back(i);
+        }
     }
+
+    std::vector<int> toLoad;
+    toLoad.reserve(currentToLoad.size() + neighborToLoad.size());
+    toLoad.insert(toLoad.end(), currentToLoad.begin(), currentToLoad.end());
+    toLoad.insert(toLoad.end(), neighborToLoad.begin(), neighborToLoad.end());
 
     if (toLoad.empty()) return;
 
@@ -173,6 +185,7 @@ void IconStreamer::onPageChanged(int currentPage, int iconsPerPage,
         m_pool.reserve(m_pool.size() + newSlots);
     }
 
+    std::vector<int> failedCurrent;
     for (auto& d : decoded) {
         if (!d.rgba) continue;
 
@@ -192,10 +205,68 @@ void IconStreamer::onPageChanged(int currentPage, int iconsPerPage,
             m_appToSlot[d.appIndex] = poolIdx;
             if (d.appIndex < (int)allIcons.size())
                 allIcons[d.appIndex]->setTexture(&slot.texture);
+        } else {
+            m_appToSlot[d.appIndex] = -1;
+            slot.appIndex = -1;
+            m_freeSlots.push_back(poolIdx);
+            if (d.appIndex >= curStart && d.appIndex < curEnd)
+                failedCurrent.push_back(d.appIndex);
         }
 
         if (d.scaledWithMalloc) std::free(d.rgba);
         else stbi_image_free(d.rgba);
+    }
+
+    // 5. If current page still has missing icons, drop preloaded neighbors and
+    //    retry only the missing current-page entries.
+    if (!failedCurrent.empty()) {
+        DebugLog::log("[streamer] page %d: retrying %d current icons after load failures",
+                      currentPage, (int)failedCurrent.size());
+
+        for (int i = 0; i < (int)m_pool.size(); ++i) {
+            int app = m_pool[i].appIndex;
+            if (app >= 0 && (app < curStart || app >= curEnd)) {
+                if (app < (int)allIcons.size())
+                    allIcons[app]->setTexture(nullptr);
+                m_appToSlot[app] = -1;
+                m_pool[i].appIndex = -1;
+                m_freeSlots.push_back(i);
+            }
+        }
+
+        for (int appIndex : failedCurrent) {
+            if (m_appToSlot[appIndex] >= 0 || m_compressed[appIndex].empty())
+                continue;
+
+            auto d = decodeAndScale(appIndex);
+            if (!d.rgba) continue;
+
+            int poolIdx;
+            if (!m_freeSlots.empty()) {
+                poolIdx = m_freeSlots.back();
+                m_freeSlots.pop_back();
+            } else {
+                poolIdx = (int)m_pool.size();
+                m_pool.emplace_back();
+            }
+
+            auto& slot = m_pool[poolIdx];
+            if (slot.texture.loadFromPixels(gpu, ren, d.rgba, d.w, d.h)) {
+                slot.appIndex = appIndex;
+                m_appToSlot[appIndex] = poolIdx;
+                if (appIndex < (int)allIcons.size())
+                    allIcons[appIndex]->setTexture(&slot.texture);
+            } else {
+                slot.appIndex = -1;
+                m_appToSlot[appIndex] = -1;
+                m_freeSlots.push_back(poolIdx);
+                DebugLog::log("[streamer] page %d: icon %d still failed after retry",
+                              currentPage, appIndex);
+            }
+
+            if (d.scaledWithMalloc) std::free(d.rgba);
+            else stbi_image_free(d.rgba);
+        }
     }
 }
 

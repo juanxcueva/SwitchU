@@ -101,26 +101,43 @@ void AppListLoader::fetchApps() {
 
         uint32_t vf = views[i].flags;
 
+        std::string cachedName;
+        bool cacheHasUsableIcon = false;
         NxTitleCacheApplicationMetadata* meta = nxtcGetApplicationMetadataEntryById(tid);
         if (meta) {
-            PendingApp a;
-            a.id      = tidBuf;
-            a.title   = meta->name ? meta->name : "";
-            a.titleId = tid;
-            a.viewFlags = vf;
+            cachedName = meta->name ? meta->name : "";
             if (meta->icon_data && meta->icon_size > 0) {
+                cacheHasUsableIcon = true;
+                PendingApp a;
+                a.id      = tidBuf;
+                a.title   = cachedName;
+                a.titleId = tid;
+                a.viewFlags = vf;
                 auto* ptr = static_cast<const uint8_t*>(meta->icon_data);
                 a.iconData.assign(ptr, ptr + meta->icon_size);
+                m_pending.push_back(std::move(a));
             }
-            m_pending.push_back(std::move(a));
             nxtcFreeApplicationMetadata(&meta);
-            continue;
+            if (cacheHasUsableIcon)
+                continue;
+
+            DebugLog::log("[loader] cache entry missing icon for %016lX, refreshing from NS", (unsigned long)tid);
         }
 
         size_t controlSize = 0;
         Result rc = nsGetApplicationControlData(NsApplicationControlSource_Storage, tid,
                                                 &controlData, sizeof(controlData), &controlSize);
-        if (R_FAILED(rc)) continue;
+        if (R_FAILED(rc)) {
+            if (!cachedName.empty()) {
+                PendingApp a;
+                a.id      = tidBuf;
+                a.title   = cachedName;
+                a.titleId = tid;
+                a.viewFlags = vf;
+                m_pending.push_back(std::move(a));
+            }
+            continue;
+        }
 
         NacpLanguageEntry* langEntry = nullptr;
         rc = nacpGetLanguageEntry(&controlData.nacp, &langEntry);

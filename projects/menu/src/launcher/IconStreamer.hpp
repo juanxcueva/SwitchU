@@ -66,7 +66,9 @@ private:
 
     int m_lastPage = -1;
 
-    // How many pages around the current one to keep loaded.
-    static constexpr int kPageMargin = 1;
+    // Keep only the visible page loaded. This is more aggressive than
+    // prefetching neighbors, but avoids starving the current page when the
+    // GPU/image budget is tight.
+    static constexpr int kPageMargin = 0;
     static constexpr int kIconSize   = 256;
 };
